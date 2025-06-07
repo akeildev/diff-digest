@@ -291,7 +291,9 @@ export async function POST(req: NextRequest) {
             }
           }
           
-          console.error('Error in analyze-diff stream:', error);
+          if (process.env.NODE_ENV === 'development') {
+            console.error('Error in analyze-diff stream:', error);
+          }
           safeEnqueue(
             encoder.encode(
               `data: ${JSON.stringify({ 
@@ -325,7 +327,9 @@ export async function POST(req: NextRequest) {
     });
     
   } catch (error) {
-    console.error('Error in analyze-diff route:', error);
+    if (process.env.NODE_ENV === 'development') {
+      console.error('Error in analyze-diff route:', error);
+    }
     
     // Handle connection reset errors gracefully
     if (error instanceof Error && 
