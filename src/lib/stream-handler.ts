@@ -28,7 +28,7 @@ export class StreamManager {
     try {
       controller.enqueue(data);
       return true;
-    } catch (error) {
+    } catch {
       this.isClosed = true;
       if (process.env.NODE_ENV === 'development') {
         console.log('Controller already closed, stopping stream');
@@ -45,7 +45,7 @@ export class StreamManager {
       try {
         controller.close();
         this.isClosed = true;
-      } catch (error) {
+      } catch {
         this.isClosed = true;
       }
     }

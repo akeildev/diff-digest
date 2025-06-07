@@ -5,18 +5,7 @@ import { shouldIncludePR, type PR } from '@/lib/utils';
 // Declare runtime explicitly for Next.js Edge
 export const runtime = 'edge';
 
-// Global error handler for uncaught exceptions in this module
-const handleUncaughtError = (error: Error) => {
-  if (error.message.includes('aborted') || error.message.includes('ECONNRESET')) {
-    // Silently ignore connection reset errors
-    if (process.env.NODE_ENV === 'development') {
-      console.log('Connection reset by client (ignored)');
-    }
-    return;
-  }
-  // Re-throw other errors
-  throw error;
-};
+// Note: Global error handler removed as it was unused
 
 export async function POST(req: NextRequest) {
   try {
@@ -57,7 +46,7 @@ export async function POST(req: NextRequest) {
           if (!isClosed) {
             try {
               controller.enqueue(data);
-            } catch (error) {
+            } catch {
               // Controller is already closed or errored
               isClosed = true;
               if (process.env.NODE_ENV === 'development') {
@@ -73,7 +62,7 @@ export async function POST(req: NextRequest) {
             try {
               controller.close();
               isClosed = true;
-            } catch (error) {
+            } catch {
               // Controller already closed
               isClosed = true;
             }

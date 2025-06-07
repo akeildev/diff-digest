@@ -95,8 +95,8 @@ export const useDiffAnalysis = ({ diffId, diffContent, description }: UseDiffAna
       typeof data === 'object' &&
       'developer' in data &&
       'marketing' in data &&
-      typeof (data as any).developer === 'string' &&
-      typeof (data as any).marketing === 'string'
+      typeof (data as Record<string, unknown>).developer === 'string' &&
+      typeof (data as Record<string, unknown>).marketing === 'string'
     );
   };
 
