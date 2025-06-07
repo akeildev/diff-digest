@@ -9,9 +9,10 @@ interface UseDiffAnalysisProps {
   diffId: string;
   diffContent: string;
   description: string;
+  onNotesUpdate?: (notes: ReleaseNotes | null, isComplete: boolean) => void;
 }
 
-export const useDiffAnalysis = ({ diffId, diffContent, description }: UseDiffAnalysisProps) => {
+export const useDiffAnalysis = ({ diffId, diffContent, description, onNotesUpdate }: UseDiffAnalysisProps) => {
   const [state, setState] = useState<AnalysisState>({
     loading: false,
     error: null,
@@ -41,20 +42,31 @@ export const useDiffAnalysis = ({ diffId, diffContent, description }: UseDiffAna
         if (typeof event.data === 'object' && event.data !== null) {
           const notesData = event.data as unknown;
           if (isValidNotesData(notesData)) {
+            const notes = notesData as ReleaseNotes;
             setState(prev => ({
               ...prev,
-              notes: notesData as ReleaseNotes
+              notes: notes
             }));
+            // Save state when notes are received
+            if (onNotesUpdate) {
+              onNotesUpdate(notes, false);
+            }
           }
         }
         break;
         
       case 'complete':
-        setState(prev => ({
-          ...prev,
-          loading: false,
-          streamProgress: ''
-        }));
+        setState(prev => {
+          // Mark as complete when stream ends
+          if (prev.notes && onNotesUpdate) {
+            onNotesUpdate(prev.notes, true);
+          }
+          return {
+            ...prev,
+            loading: false,
+            streamProgress: ''
+          };
+        });
         isAnalyzingRef.current = false;
         break;
 
@@ -84,7 +96,7 @@ export const useDiffAnalysis = ({ diffId, diffContent, description }: UseDiffAna
           console.warn('Unknown event type:', event.type);
         }
     }
-  }, []);
+  }, [onNotesUpdate]);
 
   /**
    * Type guard to validate notes data structure

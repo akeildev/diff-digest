@@ -33,3 +33,9 @@ export interface MarkdownComponentProps {
   content: string;
   className?: string;
 }
+
+export interface PersistedAnalysisState {
+  notes: ReleaseNotes | null;
+  timestamp: number;
+  isComplete: boolean;
+}

@@ -9,6 +9,7 @@
 
 import { useEffect } from 'react';
 import { useDiffAnalysis } from '@/hooks/useDiffAnalysis';
+import { usePersistedAnalysis } from '@/hooks/usePersistedAnalysis';
 import { StatusCard } from '@/components/ui/StatusCard';
 import { NotesDisplay } from '@/components/ui/NotesCard';
 import type { DiffAnalyzerProps } from '@/types/diff-analyzer';
@@ -18,6 +19,8 @@ import type { DiffAnalyzerProps } from '@/types/diff-analyzer';
  * git diffs and displaying the generated release notes.
  */
 export default function DiffAnalyzer({ diffId, diffContent, description }: DiffAnalyzerProps) {
+  const { persistedState, saveState, clearState, hasPersistedNotes } = usePersistedAnalysis(diffId);
+  
   const {
     loading,
     error,
@@ -26,15 +29,23 @@ export default function DiffAnalyzer({ diffId, diffContent, description }: DiffA
     messageInfo,
     analyzeDiff,
     resetState,
-  } = useDiffAnalysis({ diffId, diffContent, description });
+  } = useDiffAnalysis({ diffId, diffContent, description, onNotesUpdate: saveState });
 
   // Auto-analyze when diffId changes
   useEffect(() => {
+    // If we have complete persisted notes, don't re-analyze
+    if (persistedState?.notes && persistedState.isComplete) {
+      // Restore the saved notes instead of re-analyzing
+      return;
+    }
+    
     resetState();
-    if (diffContent) {
+    
+    // Only analyze if we don't have persisted notes
+    if (diffContent && !persistedState?.notes) {
       analyzeDiff();
     }
-  }, [diffId, diffContent, analyzeDiff, resetState]);
+  }, [diffId, diffContent, analyzeDiff, resetState, persistedState]);
 
   // Handle info message state
   if (messageInfo) {
@@ -94,11 +105,12 @@ export default function DiffAnalyzer({ diffId, diffContent, description }: DiffA
     );
   }
 
-  // Handle success state with notes
-  if (notes) {
+  // Handle success state with notes (either from current analysis or persisted)
+  const displayNotes = notes || persistedState?.notes;
+  if (displayNotes) {
     return (
       <div className="space-y-6 transition-all duration-300">
-        <NotesDisplay notes={notes} />
+        <NotesDisplay notes={displayNotes} />
       </div>
     );
   }

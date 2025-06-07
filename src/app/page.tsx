@@ -19,15 +19,79 @@ export default function Home() {
   const [diffs, setDiffs] = useState<Diff[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
-  const [currentPage, setCurrentPage] = useState<number>(1);
+  const [currentPage, setCurrentPage] = useState<number>(() => {
+    // Load current page from localStorage
+    if (typeof window !== 'undefined') {
+      const saved = localStorage.getItem('currentPage');
+      if (saved) {
+        return parseInt(saved, 10) || 1;
+      }
+    }
+    return 1;
+  });
   const [hasMore, setHasMore] = useState<boolean>(true);
   // State to track which cards are expanded (by default, expand none)
-  const [expandedCards, setExpandedCards] = useState<Record<string, boolean>>({});
+  const [expandedCards, setExpandedCards] = useState<Record<string, boolean>>(() => {
+    // Load expanded state from localStorage
+    if (typeof window !== 'undefined') {
+      const saved = localStorage.getItem('expandedCards');
+      if (saved) {
+        try {
+          return JSON.parse(saved);
+        } catch {
+          return {};
+        }
+      }
+    }
+    return {};
+  });
 
-  // Fetch diffs on initial load
+  // Fetch diffs on initial load - load all pages up to saved page
   useEffect(() => {
-    fetchDiffs(1);
+    const loadAllPages = async () => {
+      const savedPage = currentPage;
+      if (savedPage > 1) {
+        // Load all pages from 1 to savedPage
+        setLoading(true);
+        const allDiffs: Diff[] = [];
+        
+        for (let page = 1; page <= savedPage; page++) {
+          try {
+            const response = await fetch(`/api/sample-diffs?page=${page}`);
+            if (response.ok) {
+              const data = await response.json();
+              allDiffs.push(...data.diffs);
+              setHasMore(data.hasMore);
+            }
+          } catch (err) {
+            console.error(`Failed to fetch page ${page}:`, err);
+          }
+        }
+        
+        setDiffs(allDiffs);
+        setLoading(false);
+      } else {
+        // Just load first page
+        fetchDiffs(1);
+      }
+    };
+    
+    loadAllPages();
   }, []);
+
+  // Save expanded cards state to localStorage
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('expandedCards', JSON.stringify(expandedCards));
+    }
+  }, [expandedCards]);
+
+  // Save current page to localStorage
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('currentPage', currentPage.toString());
+    }
+  }, [currentPage]);
 
   const fetchDiffs = async (page: number) => {
     try {
@@ -176,16 +240,18 @@ export default function Home() {
                   </div>
                 </div>
 
-                {/* Collapsible Content */}
-                {expandedCards[diff.id] && (
-                  <div className="p-5 bg-white dark:bg-gray-900 transition-all duration-300">
-                    <DiffAnalyzer
-                      diffId={diff.id}
-                      diffContent={diff.diff}
-                      description={diff.description}
-                    />
-                  </div>
-                )}
+                {/* Collapsible Content - Always rendered but hidden when collapsed */}
+                <div 
+                  className={`bg-white dark:bg-gray-900 transition-all duration-300 overflow-hidden ${
+                    expandedCards[diff.id] ? 'p-5' : 'h-0'
+                  }`}
+                >
+                  <DiffAnalyzer
+                    diffId={diff.id}
+                    diffContent={diff.diff}
+                    description={diff.description}
+                  />
+                </div>
               </div>
             ))}
           </div>
