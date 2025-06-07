@@ -48,7 +48,9 @@ export default function Home() {
       setHasMore(data.hasMore);
       setCurrentPage(page);
     } catch (err) {
-      console.error("Error fetching diffs:", err);
+      if (process.env.NODE_ENV === 'development') {
+        console.error("Error fetching diffs:", err);
+      }
       setError(err instanceof Error ? err.message : "An unknown error occurred");
     } finally {
       setLoading(false);
