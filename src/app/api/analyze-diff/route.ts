@@ -1,133 +1,347 @@
 import { NextRequest } from 'next/server';
-import OpenAI from 'openai';
+import { OpenAI } from 'openai';
+import { shouldIncludePR, type PR } from '@/lib/utils';
 
-// Initialize OpenAI client
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+// Declare runtime explicitly for Next.js Edge
+export const runtime = 'edge';
 
-// Helper function to create a streaming response
-function createStreamResponse(stream: ReadableStream) {
-  return new Response(stream, {
-    headers: {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
-    },
-  });
-}
-
-export async function POST(request: NextRequest) {
+export async function POST(req: NextRequest) {
   try {
     // Parse the request body
-    const { diffId, diffContent, description } = await request.json();
+    const { diffContent, diffId, description } = await req.json();
 
     if (!diffContent) {
-      return Response.json({ error: 'Diff content is required' }, { status: 400 });
+      return new Response(
+        JSON.stringify({ error: 'Missing diff content' }),
+        { status: 400, headers: { 'Content-Type': 'application/json' } }
+      );
     }
+    
+    // Initialize OpenAI client
+    const openai = new OpenAI();
+    
+    // Use the model specified in environment variables or default to gpt-4o-mini
+    const MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 
-    // Create a transform stream for SSE
+    // Truncate diff if it's too large to prevent hitting token limits
+    const truncatedDiff = truncateDiffIfNeeded(diffContent);
+
+    // Queue for batching text chunks
+    let responseQueue: string[] = [];
+    let currentJson = '';
+    let notesFound = false;
+
+    // Create an SSE encoder stream
     const encoder = new TextEncoder();
-    const { readable, writable } = new TransformStream();
-    const writer = writable.getWriter();
+    const stream = new ReadableStream({
+      async start(controller) {
+        try {
+          // Send start event
+          controller.enqueue(
+            encoder.encode(`data: ${JSON.stringify({ 
+              type: 'start',
+              data: { diffId }
+            })}\n\n`)
+          );
 
-    // Function to send SSE messages
-    const sendMessage = async (event: string, data: any) => {
-      const message = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-      await writer.write(encoder.encode(message));
-    };
+          // Check if PR is relevant using our deterministic filtering logic
+          const prData: PR = {
+            id: diffId || 'unknown',
+            description: description || '',
+            diff: truncatedDiff || '',
+            url: '',
+          };
+          
+          const isRelevant = shouldIncludePR(prData);
 
-    // Send initial message
-    await sendMessage('start', { diffId });
+          if (!isRelevant) {
+            // If PR is not relevant, send a message and close the stream
+            controller.enqueue(
+              encoder.encode(`data: ${JSON.stringify({
+                type: 'message',
+                data: 'PR is not relevant, skipping analysis.'
+              })}\n\n`)
+            );
+            controller.close();
+            return;
+          }
 
-    // Process in the background
-    (async () => {
-      try {
-        // Prepare the prompt for the LLM
-        const prompt = `
-You are an expert software developer and technical writer tasked with generating release notes from a Git diff.
-Please analyze the following Git diff from a pull request titled: "${description}"
+          // Create prompt for the LLM
+          const prompt = createLLMPrompt(truncatedDiff, description);
 
-Diff content:
-\`\`\`
-${diffContent.slice(0, 12000)} ${diffContent.length > 12000 ? '... (truncated for length)' : ''}
-\`\`\`
+          // Start streaming the OpenAI completion
+          const completion = await openai.chat.completions.create({
+            model: MODEL,
+            messages: [{ role: 'user', content: prompt }],
+            temperature: 0.2, // Keep temperature low for consistent output
+            stream: true,
+          });
 
-Based on this diff, please generate two types of release notes:
-
-1. DEVELOPER NOTES: Technical, concise explanations focusing on what changed and why. These should be useful for other developers.
-2. MARKETING NOTES: User-centric notes highlighting the benefits of these changes in simpler language.
-
-Format your response as JSON with two arrays:
-{
-  "developer": ["note1", "note2", ...],
-  "marketing": ["note1", "note2", ...]
-}
-
-Each note should be a complete sentence or short paragraph. Generate 2-5 notes for each category.
-`;
-
-        // Call the OpenAI API with streaming
-        const completion = await openai.chat.completions.create({
-          model: process.env.OPENAI_MODEL || 'gpt-4o-mini', // Use environment variable or default
-          messages: [
-            { role: 'system', content: 'You are a helpful assistant that generates release notes from Git diffs.' },
-            { role: 'user', content: prompt }
-          ],
-          stream: true,
-        });
-
-        let accumulatedContent = '';
-
-        // Process the streaming response
-        for await (const chunk of completion) {
-          const content = chunk.choices[0]?.delta?.content || '';
-          if (content) {
-            accumulatedContent += content;
+          // Process the streaming response
+          for await (const chunk of completion) {
+            // Get the content from the chunk
+            const content = chunk.choices[0]?.delta?.content || '';
             
-            // Try to parse as JSON if it looks like complete JSON
-            if (accumulatedContent.includes('"developer"') && 
-                accumulatedContent.includes('"marketing"') && 
-                accumulatedContent.trim().endsWith('}')) {
-              try {
-                const jsonMatch = accumulatedContent.match(/\{[\s\S]*\}/);
-                if (jsonMatch) {
-                  const jsonStr = jsonMatch[0];
-                  const parsedNotes = JSON.parse(jsonStr);
+            if (content) {
+              // Add to the queue
+              responseQueue.push(content);
+              currentJson += content;
+              
+              // Send progress update after accumulating some text
+              if (responseQueue.length >= 5) {
+                const progressText = responseQueue.join('');
+                controller.enqueue(
+                  encoder.encode(`data: ${JSON.stringify({
+                    type: 'progress',
+                    data: progressText,
+                  })}\n\n`)
+                );
+                responseQueue = [];
+              }
+
+              // Try to extract JSON notes if we haven't found them yet
+              if (!notesFound && isLikelyJsonComplete(currentJson)) {
+                try {
+                  // Look for JSON object in the content
+                  const jsonMatch = extractJsonObject(currentJson);
                   
-                  // Send parsed notes
-                  await sendMessage('notes', parsedNotes);
-                  break;
+                  if (jsonMatch) {
+                    const parsedJson = JSON.parse(jsonMatch);
+                    
+                    // Check if the parsed JSON has the expected structure
+                    if (parsedJson && 
+                        typeof parsedJson.developer === 'string' && 
+                        typeof parsedJson.marketing === 'string') {
+                      
+                      // Send the notes event with the extracted JSON
+                      controller.enqueue(
+                        encoder.encode(`data: ${JSON.stringify({
+                          type: 'notes',
+                          data: {
+                            developer: parsedJson.developer,
+                            marketing: parsedJson.marketing,
+                          },
+                        })}\n\n`)
+                      );
+                      
+                      notesFound = true;
+                    }
+                  }
+                } catch (error) {
+                  // Continue accumulating more content if JSON parsing fails
+                  // Silent fail - we'll try again with the complete content later
                 }
-              } catch (e) {
-                // Not valid JSON yet, continue accumulating
               }
             }
-            
-            // Send progress update
-            await sendMessage('progress', { content });
           }
+
+          // If we haven't found valid JSON notes by the end, try one last time with the full content
+          if (!notesFound && currentJson) {
+            try {
+              const jsonMatch = extractJsonObject(currentJson);
+              
+              if (jsonMatch) {
+                const parsedJson = JSON.parse(jsonMatch);
+                
+                if (parsedJson) {
+                  // Try to extract developer and marketing notes even if the format is slightly off
+                  const developer = typeof parsedJson.developer === 'string' 
+                    ? parsedJson.developer 
+                    : (Array.isArray(parsedJson.developer) ? parsedJson.developer.join(' ') : 
+                       parsedJson.developerNotes || parsedJson.devNotes || '');
+                  
+                  const marketing = typeof parsedJson.marketing === 'string' 
+                    ? parsedJson.marketing 
+                    : (Array.isArray(parsedJson.marketing) ? parsedJson.marketing.join(' ') : 
+                       parsedJson.marketingNotes || parsedJson.userNotes || '');
+                  
+                  if (developer || marketing) {
+                    controller.enqueue(
+                      encoder.encode(`data: ${JSON.stringify({
+                        type: 'notes',
+                        data: {
+                          developer: developer || 'No developer notes generated.',
+                          marketing: marketing || 'No marketing notes generated.',
+                        },
+                      })}\n\n`)
+                    );
+                    
+                    notesFound = true;
+                  }
+                }
+              } else {
+                // If no JSON structure found, try to extract sentences as notes
+                const sentences = currentJson.split(/\.|\!|\?/).filter(s => s.trim().length > 10);
+                
+                if (sentences.length >= 2) {
+                  controller.enqueue(
+                    encoder.encode(`data: ${JSON.stringify({
+                      type: 'notes',
+                      data: {
+                        developer: sentences[0].trim() + '.',
+                        marketing: sentences[1].trim() + '.',
+                      },
+                    })}\n\n`)
+                  );
+                  
+                  notesFound = true;
+                }
+              }
+            } catch (error) {
+              // Log only in development or if error logging is enabled
+              if (process.env.NODE_ENV === 'development') {
+                console.error('Final JSON parsing error:', error);
+              }
+            }
+          }
+
+          // Send completion event
+          controller.enqueue(
+            encoder.encode(`data: ${JSON.stringify({ type: 'complete' })}\n\n`)
+          );
+          
+          // Close the stream
+          controller.close();
+        } catch (error) {
+          console.error('Error in analyze-diff stream:', error);
+          controller.enqueue(
+            encoder.encode(
+              `data: ${JSON.stringify({ 
+                type: 'error', 
+                error: error instanceof Error ? error.message : 'Unknown error during analysis' 
+              })}\n\n`
+            )
+          );
+          controller.close();
         }
+      },
+    });
 
-        // Send completion message
-        await sendMessage('complete', { diffId });
-      } catch (error) {
-        console.error('Error processing diff:', error);
-        await sendMessage('error', { 
-          message: error instanceof Error ? error.message : 'Unknown error occurred'
-        });
-      } finally {
-        writer.close();
+    // Return the stream as a response with proper SSE headers
+    return new Response(stream, {
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache, no-transform',
+        'Connection': 'keep-alive',
+        'Content-Encoding': 'none'
       }
-    })();
-
-    // Return the readable stream as the response
-    return createStreamResponse(readable);
+    });
+    
   } catch (error) {
-    console.error('API error:', error);
-    return Response.json(
-      { error: 'Failed to process request', details: error instanceof Error ? error.message : 'Unknown error' },
-      { status: 500 }
+    console.error('Error in analyze-diff route:', error);
+    return new Response(
+      JSON.stringify({ 
+        error: error instanceof Error ? error.message : 'Failed to analyze diff' 
+      }),
+      { status: 500, headers: { 'Content-Type': 'application/json' } }
     );
   }
+}
+
+/**
+ * Please see src/lib/utils.ts for the PR filtering implementation.
+ * We now use the imported shouldIncludePR utility for deterministic PR filtering.
+ */
+
+/**
+ * Truncates a diff if it's too large to prevent hitting token limits
+ */
+function truncateDiffIfNeeded(diff: string, maxLength = 12000): string {
+  if (diff.length <= maxLength) {
+    return diff;
+  }
+  
+  // Take first part and last part to keep context
+  const firstPart = diff.substring(0, maxLength * 0.7);
+  const lastPart = diff.substring(diff.length - maxLength * 0.3);
+  
+  return `${firstPart}\n\n... [diff truncated due to size] ...\n\n${lastPart}`;
+}
+
+/**
+ * Creates a prompt for the LLM to generate release notes from a diff
+ */
+function createLLMPrompt(diff: string, description: string): string {
+  return `
+You are a specialized assistant that analyzes code diffs from Pull Requests and generates concise release notes.
+
+# PR TITLE:
+${description}
+
+# DIFF CONTENT:
+\`\`\`
+${diff}
+\`\`\`
+
+# YOUR TASK:
+Generate two types of release notes for this PR, following these specific guidelines:
+
+1. Developer Notes:
+   - Technical, precise description of what changed and why
+   - Focused on implementation details, APIs, and architectural changes
+   - Single sentence, maximum 150 characters
+   - Start with an action verb
+
+2. Marketing Notes:
+   - User-focused benefits and outcomes
+   - Explain the value of the change to end-users
+   - Non-technical, accessible language
+   - Single sentence, maximum 150 characters
+
+# OUTPUT FORMAT:
+Respond ONLY with a JSON object having the following structure:
+{
+  "developer": "Single technical sentence describing the implementation change",
+  "marketing": "Single user-focused sentence describing the benefit"
+}
+
+# EXAMPLES:
+For a PR that improves error handling:
+{
+  "developer": "Enhanced API error handling with detailed logging and automatic retry mechanism for transient failures.",
+  "marketing": "Improved app reliability with smarter error recovery that prevents disruptions during network issues."
+}
+
+For a performance optimization:
+{
+  "developer": "Optimized database queries by implementing prepared statements and connection pooling, reducing query time by 40%.",
+  "marketing": "Pages now load twice as fast, giving you a smoother and more responsive experience."
+}
+`;
+}
+
+/**
+ * Checks if a string is likely to contain a complete JSON object
+ */
+function isLikelyJsonComplete(text: string): boolean {
+  const openBraces = (text.match(/{/g) || []).length;
+  const closeBraces = (text.match(/}/g) || []).length;
+  
+  return openBraces > 0 && openBraces === closeBraces;
+}
+
+/**
+ * Attempts to extract a JSON object from a text string
+ */
+function extractJsonObject(text: string): string | null {
+  // Look for patterns that might indicate a JSON object
+  const jsonPattern = /{[^{}]*({[^{}]*})*[^{}]*}/g;
+  const matches = text.match(jsonPattern);
+  
+  if (!matches || matches.length === 0) {
+    return null;
+  }
+  
+  // Try to find the first valid JSON object
+  for (const match of matches) {
+    try {
+      JSON.parse(match);
+      return match;
+    } catch {
+      // Continue to the next match if this one isn't valid JSON
+      continue;
+    }
+  }
+  
+  return null;
 }
