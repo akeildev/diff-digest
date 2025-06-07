@@ -16,28 +16,28 @@ import type { MarkdownComponentProps } from '@/types/diff-analyzer';
  * Custom markdown components with consistent styling
  */
 const markdownComponents = {
-  p: ({ children }: any) => (
+  p: ({ children }: { children?: React.ReactNode }) => (
     <p className="mb-4">{children}</p>
   ),
-  ul: ({ children }: any) => (
+  ul: ({ children }: { children?: React.ReactNode }) => (
     <ul className="list-disc ml-6 mb-4">{children}</ul>
   ),
-  ol: ({ children }: any) => (
+  ol: ({ children }: { children?: React.ReactNode }) => (
     <ol className="list-decimal ml-6 mb-4">{children}</ol>
   ),
-  li: ({ children }: any) => (
+  li: ({ children }: { children?: React.ReactNode }) => (
     <li className="mb-1">{children}</li>
   ),
-  h1: ({ children }: any) => (
+  h1: ({ children }: { children?: React.ReactNode }) => (
     <h1 className="text-xl font-bold mb-4 mt-6">{children}</h1>
   ),
-  h2: ({ children }: any) => (
+  h2: ({ children }: { children?: React.ReactNode }) => (
     <h2 className="text-lg font-bold mb-3 mt-5">{children}</h2>
   ),
-  h3: ({ children }: any) => (
+  h3: ({ children }: { children?: React.ReactNode }) => (
     <h3 className="text-md font-bold mb-2 mt-4">{children}</h3>
   ),
-  code: ({ children, className }: any) => {
+  code: ({ children, className }: { children?: React.ReactNode; className?: string }) => {
     const isInline = !className;
     return isInline ? (
       <code className="bg-gray-800 text-white dark:text-gray-100 px-1.5 py-0.5 rounded text-sm font-mono">
@@ -49,7 +49,7 @@ const markdownComponents = {
       </code>
     );
   },
-  pre: ({ children }: any) => (
+  pre: ({ children }: { children?: React.ReactNode }) => (
     <pre className="my-4 bg-gray-800 rounded-md overflow-hidden">{children}</pre>
   ),
 };
