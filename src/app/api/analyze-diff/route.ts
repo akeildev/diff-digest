@@ -5,6 +5,19 @@ import { shouldIncludePR, type PR } from '@/lib/utils';
 // Declare runtime explicitly for Next.js Edge
 export const runtime = 'edge';
 
+// Global error handler for uncaught exceptions in this module
+const handleUncaughtError = (error: Error) => {
+  if (error.message.includes('aborted') || error.message.includes('ECONNRESET')) {
+    // Silently ignore connection reset errors
+    if (process.env.NODE_ENV === 'development') {
+      console.log('Connection reset by client (ignored)');
+    }
+    return;
+  }
+  // Re-throw other errors
+  throw error;
+};
+
 export async function POST(req: NextRequest) {
   try {
     // Parse the request body
@@ -33,16 +46,50 @@ export async function POST(req: NextRequest) {
 
     // Create an SSE encoder stream
     const encoder = new TextEncoder();
+    let isClosed = false;
+    const abortController = new AbortController();
+    
     const stream = new ReadableStream({
       async start(controller) {
+        
+        // Helper function to safely enqueue data
+        const safeEnqueue = (data: Uint8Array) => {
+          if (!isClosed) {
+            try {
+              controller.enqueue(data);
+            } catch (error) {
+              // Controller is already closed or errored
+              isClosed = true;
+              if (process.env.NODE_ENV === 'development') {
+                console.log('Controller already closed, stopping stream');
+              }
+            }
+          }
+        };
+        
+        // Helper function to safely close controller
+        const safeClose = () => {
+          if (!isClosed) {
+            try {
+              controller.close();
+              isClosed = true;
+            } catch (error) {
+              // Controller already closed
+              isClosed = true;
+            }
+          }
+        };
+        
         try {
           // Send start event
-          controller.enqueue(
+          safeEnqueue(
             encoder.encode(`data: ${JSON.stringify({ 
               type: 'start',
               data: { diffId }
             })}\n\n`)
           );
+          
+          if (isClosed) return;
 
           // Check if PR is relevant using our deterministic filtering logic
           const prData: PR = {
@@ -56,83 +103,123 @@ export async function POST(req: NextRequest) {
 
           if (!isRelevant) {
             // If PR is not relevant, send a message and close the stream
-            controller.enqueue(
+            safeEnqueue(
               encoder.encode(`data: ${JSON.stringify({
                 type: 'message',
                 data: 'PR is not relevant, skipping analysis.'
               })}\n\n`)
             );
-            controller.close();
+            safeClose();
             return;
           }
+          
+          if (isClosed) return;
 
           // Create prompt for the LLM
           const prompt = createLLMPrompt(truncatedDiff, description);
 
           // Start streaming the OpenAI completion
-          const completion = await openai.chat.completions.create({
-            model: MODEL,
-            messages: [{ role: 'user', content: prompt }],
-            temperature: 0.2, // Keep temperature low for consistent output
-            stream: true,
-          });
+          let completion;
+          try {
+            completion = await openai.chat.completions.create({
+              model: MODEL,
+              messages: [{ role: 'user', content: prompt }],
+              temperature: 0.2, // Keep temperature low for consistent output
+              stream: true,
+            }, {
+              signal: abortController.signal
+            });
+          } catch (openaiError) {
+            if (openaiError instanceof Error && 
+                (openaiError.name === 'AbortError' || openaiError.message.includes('aborted'))) {
+              safeClose();
+              return;
+            }
+            throw openaiError;
+          }
 
           // Process the streaming response
-          for await (const chunk of completion) {
-            // Get the content from the chunk
-            const content = chunk.choices[0]?.delta?.content || '';
-            
-            if (content) {
-              // Add to the queue
-              responseQueue.push(content);
-              currentJson += content;
-              
-              // Send progress update after accumulating some text
-              if (responseQueue.length >= 5) {
-                const progressText = responseQueue.join('');
-                controller.enqueue(
-                  encoder.encode(`data: ${JSON.stringify({
-                    type: 'progress',
-                    data: progressText,
-                  })}\n\n`)
-                );
-                responseQueue = [];
+          try {
+            for await (const chunk of completion) {
+              // Check if connection was aborted
+              if (isClosed || abortController.signal.aborted) {
+                break;
               }
-
-              // Try to extract JSON notes if we haven't found them yet
-              if (!notesFound && isLikelyJsonComplete(currentJson)) {
-                try {
-                  // Look for JSON object in the content
-                  const jsonMatch = extractJsonObject(currentJson);
+              
+              // Get the content from the chunk
+              const content = chunk.choices[0]?.delta?.content || '';
+              
+              if (content) {
+                // Add to the queue
+                responseQueue.push(content);
+                currentJson += content;
+                
+                // Send progress update after accumulating some text
+                if (responseQueue.length >= 5) {
+                  const progressText = responseQueue.join('');
+                  safeEnqueue(
+                    encoder.encode(`data: ${JSON.stringify({
+                      type: 'progress',
+                      data: progressText,
+                    })}\n\n`)
+                  );
+                  responseQueue = [];
                   
-                  if (jsonMatch) {
-                    const parsedJson = JSON.parse(jsonMatch);
+                  if (isClosed) break;
+                }
+
+                // Try to extract JSON notes if we haven't found them yet
+                if (!notesFound && isLikelyJsonComplete(currentJson)) {
+                  try {
+                    // Look for JSON object in the content
+                    const jsonMatch = extractJsonObject(currentJson);
                     
-                    // Check if the parsed JSON has the expected structure
-                    if (parsedJson && 
-                        typeof parsedJson.developer === 'string' && 
-                        typeof parsedJson.marketing === 'string') {
+                    if (jsonMatch) {
+                      const parsedJson = JSON.parse(jsonMatch);
                       
-                      // Send the notes event with the extracted JSON
-                      controller.enqueue(
-                        encoder.encode(`data: ${JSON.stringify({
-                          type: 'notes',
-                          data: {
-                            developer: parsedJson.developer,
-                            marketing: parsedJson.marketing,
-                          },
-                        })}\n\n`)
-                      );
-                      
-                      notesFound = true;
+                      // Check if the parsed JSON has the expected structure
+                      if (parsedJson && 
+                          typeof parsedJson.developer === 'string' && 
+                          typeof parsedJson.marketing === 'string') {
+                        
+                        // Send the notes event with the extracted JSON
+                        safeEnqueue(
+                          encoder.encode(`data: ${JSON.stringify({
+                            type: 'notes',
+                            data: {
+                              developer: parsedJson.developer,
+                              marketing: parsedJson.marketing,
+                            },
+                          })}\n\n`)
+                        );
+                        
+                        notesFound = true;
+                        
+                        if (isClosed) break;
+                      }
                     }
+                  } catch {
+                    // Continue accumulating more content if JSON parsing fails
+                    // Silent fail - we'll try again with the complete content later
                   }
-                } catch (error) {
-                  // Continue accumulating more content if JSON parsing fails
-                  // Silent fail - we'll try again with the complete content later
                 }
               }
             }
+          } catch (streamError) {
+            // Handle streaming errors specifically
+            if (streamError instanceof Error) {
+              if (streamError.name === 'AbortError' || 
+                  streamError.message.includes('aborted') || 
+                  streamError.message.includes('ECONNRESET')) {
+                // Connection was aborted, just close silently
+                if (process.env.NODE_ENV === 'development') {
+                  console.log('OpenAI stream aborted by client');
+                }
+                safeClose();
+                return;
+              }
+            }
+            throw streamError; // Re-throw other errors to be caught by outer try-catch
           }
 
           // If we haven't found valid JSON notes by the end, try one last time with the full content
@@ -156,7 +243,7 @@ export async function POST(req: NextRequest) {
                        parsedJson.marketingNotes || parsedJson.userNotes || '');
                   
                   if (developer || marketing) {
-                    controller.enqueue(
+                    safeEnqueue(
                       encoder.encode(`data: ${JSON.stringify({
                         type: 'notes',
                         data: {
@@ -174,7 +261,7 @@ export async function POST(req: NextRequest) {
                 const sentences = currentJson.split(/\.|\!|\?/).filter(s => s.trim().length > 10);
                 
                 if (sentences.length >= 2) {
-                  controller.enqueue(
+                  safeEnqueue(
                     encoder.encode(`data: ${JSON.stringify({
                       type: 'notes',
                       data: {
@@ -196,15 +283,27 @@ export async function POST(req: NextRequest) {
           }
 
           // Send completion event
-          controller.enqueue(
+          safeEnqueue(
             encoder.encode(`data: ${JSON.stringify({ type: 'complete' })}\n\n`)
           );
           
           // Close the stream
-          controller.close();
+          safeClose();
         } catch (error) {
+          // Handle different types of errors
+          if (error instanceof Error) {
+            if (error.name === 'AbortError' || error.message.includes('aborted')) {
+              // Connection was aborted, just close silently
+              if (process.env.NODE_ENV === 'development') {
+                console.log('Stream aborted by client');
+              }
+              safeClose();
+              return;
+            }
+          }
+          
           console.error('Error in analyze-diff stream:', error);
-          controller.enqueue(
+          safeEnqueue(
             encoder.encode(
               `data: ${JSON.stringify({ 
                 type: 'error', 
@@ -212,9 +311,18 @@ export async function POST(req: NextRequest) {
               })}\n\n`
             )
           );
-          controller.close();
+          safeClose();
         }
       },
+      
+      cancel() {
+        // Called when the client disconnects
+        isClosed = true;
+        abortController.abort();
+        if (process.env.NODE_ENV === 'development') {
+          console.log('Stream cancelled by client');
+        }
+      }
     });
 
     // Return the stream as a response with proper SSE headers
@@ -229,6 +337,14 @@ export async function POST(req: NextRequest) {
     
   } catch (error) {
     console.error('Error in analyze-diff route:', error);
+    
+    // Handle connection reset errors gracefully
+    if (error instanceof Error && 
+        (error.message.includes('aborted') || error.message.includes('ECONNRESET'))) {
+      // Return an empty response for aborted connections
+      return new Response('', { status: 499 }); // 499 Client Closed Request
+    }
+    
     return new Response(
       JSON.stringify({ 
         error: error instanceof Error ? error.message : 'Failed to analyze diff' 
@@ -263,7 +379,7 @@ function truncateDiffIfNeeded(diff: string, maxLength = 12000): string {
  */
 function createLLMPrompt(diff: string, description: string): string {
   return `
-You are a specialized assistant that analyzes code diffs from Pull Requests and generates concise release notes.
+You are a specialized assistant that analyzes code diffs from Pull Requests and generates extremely concise release notes.
 
 # PR TITLE:
 ${description}
@@ -277,35 +393,36 @@ ${diff}
 Generate two types of release notes for this PR, following these specific guidelines:
 
 1. Developer Notes:
-   - Technical, precise description of what changed and why
-   - Focused on implementation details, APIs, and architectural changes
-   - Single sentence, maximum 150 characters
-   - Start with an action verb
+   - Technical, extremely concise (max 100 characters)
+   - Start with a verb
+   - Focus only on the core technical change
+   - Use markdown code tags for technical terms
+   - Single sentence only
 
 2. Marketing Notes:
-   - User-focused benefits and outcomes
-   - Explain the value of the change to end-users
-   - Non-technical, accessible language
-   - Single sentence, maximum 150 characters
+   - User-focused benefit (max 100 characters)
+   - Simple, non-technical language
+   - Bold the main benefit
+   - Single sentence only
 
 # OUTPUT FORMAT:
 Respond ONLY with a JSON object having the following structure:
 {
-  "developer": "Single technical sentence describing the implementation change",
-  "marketing": "Single user-focused sentence describing the benefit"
+  "developer": "Brief technical note (max 100 chars)",
+  "marketing": "Brief user benefit (max 100 chars)"
 }
 
 # EXAMPLES:
 For a PR that improves error handling:
 {
-  "developer": "Enhanced API error handling with detailed logging and automatic retry mechanism for transient failures.",
-  "marketing": "Improved app reliability with smarter error recovery that prevents disruptions during network issues."
+  "developer": "Added \`retryMiddleware\` to API calls with exponential backoff for transient failures.",
+  "marketing": "**Enhanced reliability** prevents disruptions during network issues."
 }
 
 For a performance optimization:
 {
-  "developer": "Optimized database queries by implementing prepared statements and connection pooling, reducing query time by 40%.",
-  "marketing": "Pages now load twice as fast, giving you a smoother and more responsive experience."
+  "developer": "Optimized database queries using \`preparedStatements\`, reducing load times by 40%.",
+  "marketing": "**Pages load twice as fast** for a smoother browsing experience."
 }
 `;
 }

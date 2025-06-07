@@ -61,7 +61,11 @@ export async function GET(request: NextRequest) {
         });
         
         if (!diffResponse.ok) {
-          throw new Error(`Failed to fetch diff for PR #${number}: ${diffResponse.statusText}`);
+          // Skip PRs that can't be accessed (rate limits, permissions, etc.)
+          if (process.env.NODE_ENV === 'development') {
+            console.log(`Skipping PR #${number}: ${diffResponse.status} ${diffResponse.statusText}`);
+          }
+          return null;
         }
         
         const diff = await diffResponse.text();
