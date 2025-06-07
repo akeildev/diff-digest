@@ -18,6 +18,15 @@ interface ApiResponse {
   perPage: number;
 }
 
+// Simple component to display diff content
+const DiffViewer = ({ diff }: { diff: string }) => {
+  return (
+    <div className="mt-4 p-4 bg-gray-100 dark:bg-gray-900 rounded-md overflow-auto max-h-[500px]">
+      <pre className="text-xs whitespace-pre-wrap font-mono">{diff}</pre>
+    </div>
+  );
+};
+
 export default function Home() {
   const [diffs, setDiffs] = useState<DiffItem[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(false);
@@ -25,6 +34,7 @@ export default function Home() {
   const [currentPage, setCurrentPage] = useState<number>(1);
   const [nextPage, setNextPage] = useState<number | null>(null);
   const [initialFetchDone, setInitialFetchDone] = useState<boolean>(false);
+  const [selectedDiffId, setSelectedDiffId] = useState<string | null>(null);
 
   const fetchDiffs = async (page: number) => {
     setIsLoading(true);
@@ -63,6 +73,7 @@ export default function Home() {
 
   const handleFetchClick = () => {
     setDiffs([]); // Clear existing diffs when fetching the first page again
+    setSelectedDiffId(null); // Clear selected diff when fetching new diffs
     fetchDiffs(1);
   };
 
@@ -70,6 +81,14 @@ export default function Home() {
     if (nextPage) {
       fetchDiffs(nextPage);
     }
+  };
+
+  // Get the selected diff object
+  const selectedDiff = diffs.find((diff) => diff.id === selectedDiffId);
+  
+  // Toggle diff selection
+  const handleSelectDiff = (id: string) => {
+    setSelectedDiffId((prevId) => (prevId === id ? null : id));
   };
 
   return (
@@ -114,19 +133,35 @@ export default function Home() {
           )}
 
           {diffs.length > 0 && (
-            <ul className="space-y-3 list-disc list-inside">
+            <ul className="space-y-4">
               {diffs.map((item) => (
-                <li key={item.id} className="text-gray-800 dark:text-gray-200">
-                  <a
-                    href={item.url}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-blue-600 dark:text-blue-400 hover:underline"
-                  >
-                    PR #{item.id}:
-                  </a>
-                  <span className="ml-2">{item.description}</span>
-                  {/* We won't display the full diff here, just the description */}
+                <li key={item.id} className="border border-gray-200 dark:border-gray-700 rounded-md p-4">
+                  <div className="flex justify-between items-center">
+                    <div>
+                      <a
+                        href={item.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-blue-600 dark:text-blue-400 hover:underline font-medium"
+                      >
+                        PR #{item.id}:
+                      </a>
+                      <span className="ml-2">{item.description}</span>
+                    </div>
+                    <button
+                      onClick={() => handleSelectDiff(item.id)}
+                      className={`px-3 py-1 rounded text-sm ${
+                        selectedDiffId === item.id
+                          ? "bg-blue-600 text-white"
+                          : "bg-gray-200 dark:bg-gray-700 text-gray-800 dark:text-gray-200"
+                      }`}
+                    >
+                      {selectedDiffId === item.id ? "Hide Diff" : "View Diff"}
+                    </button>
+                  </div>
+                  
+                  {/* Show diff content if this item is selected */}
+                  {selectedDiffId === item.id && <DiffViewer diff={item.diff} />}
                 </li>
               ))}
             </ul>
