@@ -19,7 +19,7 @@ import type { DiffAnalyzerProps } from '@/types/diff-analyzer';
  * git diffs and displaying the generated release notes.
  */
 export default function DiffAnalyzer({ diffId, diffContent, description }: DiffAnalyzerProps) {
-  const { persistedState, saveState, clearState, hasPersistedNotes } = usePersistedAnalysis(diffId);
+  const { persistedState, saveState } = usePersistedAnalysis(diffId);
   
   const {
     loading,

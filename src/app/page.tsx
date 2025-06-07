@@ -77,6 +77,7 @@ export default function Home() {
     };
     
     loadAllPages();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Save expanded cards state to localStorage
